@@ -1,0 +1,854 @@
+#!/usr/bin/env python3
+"""diffbox - a very light GitKraken: changed files, side-by-side diff, discard.
+
+Runs a local web UI (127.0.0.1 only) against any git repository.
+
+    diffbox                 # current repo
+    diffbox ~/dev/edge      # a specific repo
+    diffbox --port 3090 --no-open
+"""
+
+import argparse
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from socketserver import ThreadingMixIn
+from urllib.parse import urlparse, parse_qs
+
+DEFAULT_PORT = 3085
+BIND_HOST = "127.0.0.1"  # destructive ops live here; never bind wider
+
+HERE = Path(__file__).resolve().parent
+
+
+# ---------------------------------------------------------------- git helpers
+
+
+class GitError(Exception):
+    pass
+
+
+class Repo:
+    def __init__(self, path: Path):
+        self.root = self._toplevel(path)
+
+    @staticmethod
+    def _toplevel(path: Path) -> Path:
+        try:
+            out = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=str(path), capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        except subprocess.CalledProcessError:
+            raise GitError(f"not a git repository: {path}")
+        return Path(out)
+
+    def run(self, args, stdin=None, check=True):
+        p = subprocess.run(
+            ["git"] + args, cwd=str(self.root),
+            input=stdin, capture_output=True, text=True,
+        )
+        if check and p.returncode != 0:
+            raise GitError((p.stderr or p.stdout).strip() or f"git {' '.join(args)} failed")
+        return p
+
+    def run_bytes(self, args):
+        return subprocess.run(
+            ["git"] + args, cwd=str(self.root), capture_output=True
+        ).stdout
+
+    # -- state ----------------------------------------------------------
+
+    def branch(self):
+        p = self.run(["rev-parse", "--abbrev-ref", "HEAD"], check=False)
+        name = p.stdout.strip()
+        return name if p.returncode == 0 and name else "(no commits)"
+
+    def has_head(self):
+        return self.run(["rev-parse", "--verify", "HEAD"], check=False).returncode == 0
+
+    def status(self):
+        """Working tree vs HEAD, the way a WIP node reads in GitKraken."""
+        raw = self.run_bytes(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        entries, parts, i = [], raw.split(b"\x00"), 0
+        while i < len(parts):
+            chunk = parts[i]
+            i += 1
+            if not chunk:
+                continue
+            code, path = chunk[:2].decode(), chunk[3:].decode("utf-8", "replace")
+            orig = None
+            if code[0] in ("R", "C"):  # rename/copy: next NUL field is the source
+                orig = parts[i].decode("utf-8", "replace") if i < len(parts) else None
+                i += 1
+            entries.append((code, path, orig))
+
+        stats = self._numstat()
+        files = []
+        for code, path, orig in entries:
+            untracked = code == "??"
+            adds, dels, binary = stats.get(path, (0, 0, False))
+            if untracked:
+                adds, binary = self._count_new_file(path)
+                dels = 0
+            files.append({
+                "path": path,
+                "orig": orig,
+                "status": self._label(code, untracked),
+                "code": code,
+                "staged": code[0] not in (" ", "?"),
+                "unstaged": code[1] not in (" ", "?") or untracked,
+                "untracked": untracked,
+                "adds": adds,
+                "dels": dels,
+                "binary": binary,
+            })
+        files.sort(key=lambda f: f["path"])
+        return files
+
+    def _numstat(self):
+        if not self.has_head():
+            return {}
+        out = self.run(["diff", "HEAD", "--numstat", "-z"], check=False).stdout
+        stats = {}
+        fields = out.split("\x00")
+        i = 0
+        while i < len(fields):
+            rec = fields[i]
+            i += 1
+            if not rec.strip():
+                continue
+            try:
+                a, d, name = rec.split("\t")
+            except ValueError:
+                continue
+            if name == "":  # rename: two more NUL fields (old, new)
+                i += 1
+                name = fields[i] if i < len(fields) else ""
+                i += 1
+            binary = a == "-" or d == "-"
+            stats[name] = (0 if binary else int(a), 0 if binary else int(d), binary)
+        return stats
+
+    def _count_new_file(self, path):
+        f = self.root / path
+        try:
+            data = f.read_bytes()
+        except OSError:
+            return 0, False
+        if b"\x00" in data[:8000]:
+            return 0, True
+        if not data:
+            return 0, False
+        return data.count(b"\n") + (0 if data.endswith(b"\n") else 1), False
+
+    @staticmethod
+    def _label(code, untracked):
+        if untracked:
+            return "new"
+        letters = {"A": "added", "D": "deleted", "M": "modified",
+                   "R": "renamed", "C": "copied", "U": "conflict", "T": "typechange"}
+        for ch in code:
+            if ch in letters:
+                return letters[ch]
+        return "modified"
+
+    # -- diff -----------------------------------------------------------
+
+    def raw_diff(self, path, untracked=False):
+        if untracked:
+            return self.run(
+                ["diff", "--no-color", "--no-ext-diff", "-U3",
+                 "--no-index", "--", os.devnull, path],
+                check=False,
+            ).stdout
+        base = ["diff", "--no-color", "--no-ext-diff", "-U3"]
+        if self.has_head():
+            base.append("HEAD")
+        return self.run(base + ["--", path], check=False).stdout
+
+    def diff(self, path, untracked=False):
+        text = self.raw_diff(path, untracked)
+        if not text.strip():
+            return {"path": path, "binary": False, "hunks": [], "empty": True}
+        if re.search(r"^Binary files ", text, re.M) or "GIT binary patch" in text:
+            return {"path": path, "binary": True, "hunks": [], "empty": False}
+        return {"path": path, "binary": False, "hunks": parse_hunks(text), "empty": False}
+
+    # -- destructive ----------------------------------------------------
+
+    def discard_file(self, path, untracked=False):
+        if untracked:
+            target = (self.root / path).resolve()
+            if not str(target).startswith(str(self.root.resolve())):
+                raise GitError("refusing to touch a path outside the repo")
+            if target.is_file() or target.is_symlink():
+                target.unlink()
+            return
+        if self.has_head():
+            self.run(["restore", "--source=HEAD", "--staged", "--worktree", "--", path])
+        else:
+            self.run(["rm", "-f", "--cached", "--", path], check=False)
+            (self.root / path).unlink(missing_ok=True)
+
+    def discard_hunk(self, path, index, untracked=False):
+        if untracked:
+            raise GitError("that file is untracked — discard the whole file instead")
+        text = self.raw_diff(path)
+        header, hunks = split_patch(text)
+        if index < 0 or index >= len(hunks):
+            raise GitError("that hunk is gone — refresh and try again")
+        # A partially staged file cannot be reverse-applied to the worktree
+        # alone without desyncing the index, so unstage it first.
+        code = next((f["code"] for f in self.status() if f["path"] == path), "  ")
+        if code[0] not in (" ", "?"):
+            self.run(["restore", "--staged", "--", path], check=False)
+        patch = header + hunks[index]
+        if not patch.endswith("\n"):
+            patch += "\n"
+        p = self.run(["apply", "--reverse", "--unidiff-zero", "-"], stdin=patch, check=False)
+        if p.returncode != 0:
+            raise GitError(p.stderr.strip() or "could not discard that hunk")
+
+    def discard_all(self, include_untracked=False):
+        if self.has_head():
+            self.run(["reset", "--hard", "HEAD"])
+        else:
+            self.run(["rm", "-rf", "--cached", "."], check=False)
+        if include_untracked:
+            self.run(["clean", "-fd"])
+
+
+# ------------------------------------------------------------ patch parsing
+
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
+
+
+def split_patch(text):
+    """Return (file header, [hunk texts]) for a single-file unified diff."""
+    lines = text.splitlines(keepends=True)
+    header, hunks, cur = [], [], None
+    for line in lines:
+        if line.startswith("@@"):
+            if cur is not None:
+                hunks.append("".join(cur))
+            cur = [line]
+        elif cur is None:
+            header.append(line)
+        else:
+            cur.append(line)
+    if cur is not None:
+        hunks.append("".join(cur))
+    return "".join(header), hunks
+
+
+def parse_hunks(text):
+    """Unified diff -> side-by-side rows."""
+    _, raw_hunks = split_patch(text)
+    out = []
+    for h_index, raw in enumerate(raw_hunks):
+        lines = raw.splitlines()
+        m = HUNK_RE.match(lines[0])
+        if not m:
+            continue
+        old_no, new_no = int(m.group(1)), int(m.group(3))
+        rows, dels, adds = [], [], []
+
+        def flush():
+            nonlocal dels, adds
+            for i in range(max(len(dels), len(adds))):
+                left = dels[i] if i < len(dels) else None
+                right = adds[i] if i < len(adds) else None
+                if left and right:
+                    lseg, rseg = inline_segments(left[1], right[1])
+                    rows.append({"type": "mod", "oldNo": left[0], "newNo": right[0],
+                                 "old": lseg, "new": rseg})
+                elif left:
+                    rows.append({"type": "del", "oldNo": left[0], "newNo": None,
+                                 "old": [[left[1], False]], "new": None})
+                else:
+                    rows.append({"type": "add", "oldNo": None, "newNo": right[0],
+                                 "old": None, "new": [[right[1], False]]})
+            dels, adds = [], []
+
+        for line in lines[1:]:
+            if not line:
+                line = " "
+            tag, body = line[0], line[1:]
+            if tag == "\\":  # "\ No newline at end of file"
+                continue
+            if tag == "-":
+                dels.append((old_no, body)); old_no += 1
+            elif tag == "+":
+                adds.append((new_no, body)); new_no += 1
+            else:
+                flush()
+                rows.append({"type": "ctx", "oldNo": old_no, "newNo": new_no,
+                             "old": [[body, False]], "new": [[body, False]]})
+                old_no += 1; new_no += 1
+        flush()
+        out.append({"index": h_index, "header": m.group(5).strip(), "rows": rows})
+    return out
+
+
+def inline_segments(a, b):
+    """Char-level highlight for a changed line pair, GitKraken-style."""
+    if len(a) > 600 or len(b) > 600:
+        return [[a, True]], [[b, True]]
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    if sm.quick_ratio() < 0.3:
+        return [[a, True]], [[b, True]]
+    left, right = [], []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            if i2 > i1:
+                left.append([a[i1:i2], False])
+            if j2 > j1:
+                right.append([b[j1:j2], False])
+        else:
+            if i2 > i1:
+                left.append([a[i1:i2], True])
+            if j2 > j1:
+                right.append([b[j1:j2], True])
+    return left or [["", False]], right or [["", False]]
+
+
+# ------------------------------------------------------------------- the UI
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>diffbox</title>
+<style>
+:root {
+  --bg: #0d1117; --surface: #12181f; --surface-2: #161b22; --border: #262d36;
+  --text: #e6edf3; --dim: #8b949e; --faint: #5a6472;
+  --accent: #58a6ff; --green: #3fb950; --red: #f85149; --amber: #d29922;
+  --add-bg: rgba(46,160,67,.13); --add-hi: rgba(46,160,67,.36);
+  --del-bg: rgba(248,81,73,.11); --del-hi: rgba(248,81,73,.32);
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  --sidebar: 320px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  background: var(--bg); color: var(--text);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+.btn {
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+  padding: 4px 10px; border-radius: 6px; font-size: 12px; line-height: 18px;
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+}
+.btn:hover { background: #1d242d; border-color: #384049; }
+.btn.danger:hover { background: rgba(248,81,73,.14); border-color: rgba(248,81,73,.5); color: #ff9a94; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #06131f; font-weight: 600; }
+.btn.primary:hover { background: #79b8ff; }
+
+/* ---- top bar ---- */
+header {
+  display: flex; align-items: center; gap: 12px; padding: 9px 14px;
+  border-bottom: 1px solid var(--border); background: var(--surface); flex: none;
+}
+.repo { font-weight: 600; letter-spacing: -.01em; }
+.branch {
+  font-family: var(--mono); font-size: 11px; color: var(--accent);
+  background: rgba(88,166,255,.1); border: 1px solid rgba(88,166,255,.25);
+  padding: 1px 7px; border-radius: 999px;
+}
+.spacer { flex: 1; }
+.hint { color: var(--faint); font-size: 11px; font-family: var(--mono); }
+
+/* ---- layout ---- */
+main { flex: 1; display: flex; min-height: 0; }
+aside {
+  width: var(--sidebar); flex: none; border-right: 1px solid var(--border);
+  background: var(--surface); display: flex; flex-direction: column; min-height: 0;
+}
+.aside-head {
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  border-bottom: 1px solid var(--border); color: var(--dim); font-size: 11px;
+  text-transform: uppercase; letter-spacing: .06em;
+}
+.aside-head .count { color: var(--text); font-weight: 600; }
+#files { overflow-y: auto; flex: 1; padding: 4px 0 40px; }
+
+.file {
+  display: flex; align-items: center; gap: 8px; padding: 5px 10px 5px 12px;
+  cursor: pointer; border-left: 2px solid transparent;
+}
+.file:hover { background: var(--surface-2); }
+.file.sel { background: #1b2432; border-left-color: var(--accent); }
+.file .mark {
+  font-family: var(--mono); font-size: 10px; font-weight: 700; width: 15px; height: 15px;
+  flex: none; border-radius: 4px; display: grid; place-items: center;
+}
+.mark.modified { color: var(--amber); background: rgba(210,153,34,.15); }
+.mark.new      { color: var(--green); background: rgba(63,185,80,.15); }
+.mark.added    { color: var(--green); background: rgba(63,185,80,.15); }
+.mark.deleted  { color: var(--red);   background: rgba(248,81,73,.15); }
+.mark.renamed  { color: var(--accent);background: rgba(88,166,255,.15); }
+.mark.conflict { color: var(--red);   background: rgba(248,81,73,.25); }
+.file .name { flex: 1; min-width: 0; font-family: var(--mono); font-size: 12px; }
+.file .name b { font-weight: 500; }
+.file .name span { color: var(--faint); }
+.file .stat { font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+.file .stat .a { color: var(--green); }
+.file .stat .d { color: var(--red); }
+.file .x { opacity: 0; color: var(--dim); padding: 0 2px; font-size: 14px; line-height: 1; }
+.file:hover .x { opacity: 1; }
+.file .x:hover { color: var(--red); }
+.staged-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); flex: none; }
+
+/* ---- diff pane ---- */
+section { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg); }
+.diff-head {
+  display: flex; align-items: center; gap: 10px; padding: 8px 14px;
+  border-bottom: 1px solid var(--border); background: var(--surface); flex: none;
+}
+.diff-head .path { font-family: var(--mono); font-size: 12px; }
+.diff-head .path span { color: var(--faint); }
+#diff { flex: 1; overflow: auto; }
+
+.hunk { border-bottom: 1px solid var(--border); }
+.hunk-head {
+  display: flex; align-items: center; gap: 10px; padding: 3px 12px;
+  background: #101823; color: var(--faint); font-family: var(--mono); font-size: 11px;
+  position: sticky; top: 0; z-index: 2; border-bottom: 1px solid var(--border);
+}
+.hunk-head .btn { opacity: 0; padding: 1px 8px; font-size: 11px; }
+.hunk:hover .hunk-head .btn { opacity: 1; }
+
+table.sbs { border-collapse: collapse; width: 100%; table-layout: fixed; font-family: var(--mono); font-size: 12px; }
+table.sbs td { vertical-align: top; padding: 0; }
+td.n {
+  width: 52px; text-align: right; padding: 0 10px 0 4px; color: var(--faint);
+  user-select: none; background: var(--surface); border-right: 1px solid var(--border);
+  font-size: 11px; font-variant-numeric: tabular-nums;
+}
+td.c { width: calc(50% - 52px); padding: 0 12px; white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; }
+body.nowrap table.sbs { table-layout: auto; width: max-content; min-width: 100%; }
+body.nowrap td.c { white-space: pre; width: auto; }
+tr.del td.c.l, tr.mod td.c.l { background: var(--del-bg); }
+tr.add td.c.r, tr.mod td.c.r { background: var(--add-bg); }
+tr.del td.c.r, tr.add td.c.l { background: #0f141a; }
+td.c i { font-style: normal; border-radius: 2px; }
+tr.mod td.c.l i.h, tr.del td.c.l i.h { background: var(--del-hi); }
+tr.mod td.c.r i.h, tr.add td.c.r i.h { background: var(--add-hi); }
+tr:hover td.n { color: var(--dim); }
+
+.empty { display: grid; place-items: center; height: 100%; color: var(--faint); text-align: center; padding: 40px; }
+.empty .big { font-size: 15px; color: var(--dim); margin-bottom: 6px; }
+.empty kbd {
+  font-family: var(--mono); font-size: 11px; border: 1px solid var(--border);
+  border-radius: 4px; padding: 1px 5px; background: var(--surface-2); color: var(--dim);
+}
+
+/* ---- modal + toast ---- */
+#veil { position: fixed; inset: 0; background: rgba(1,4,9,.7); display: grid; place-items: center; z-index: 50; }
+.modal {
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px;
+  padding: 18px; width: min(440px, 92vw); box-shadow: 0 18px 50px rgba(0,0,0,.55);
+}
+.modal h3 { font-size: 14px; margin-bottom: 8px; }
+.modal p { color: var(--dim); font-size: 12.5px; margin-bottom: 6px; }
+.modal code { font-family: var(--mono); color: var(--text); word-break: break-all; }
+.modal .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+.modal label { display: flex; gap: 7px; align-items: center; color: var(--dim); font-size: 12.5px; margin-top: 10px; }
+#toast {
+  position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
+  padding: 9px 14px; font-size: 12.5px; z-index: 60; max-width: 70vw;
+  box-shadow: 0 10px 30px rgba(0,0,0,.5);
+}
+#toast.err { border-color: rgba(248,81,73,.5); color: #ffb4ae; }
+#toast.ok { border-color: rgba(63,185,80,.4); color: #7ee787; }
+[hidden] { display: none !important; }
+::-webkit-scrollbar { width: 11px; height: 11px; }
+::-webkit-scrollbar-thumb { background: #2c333c; border-radius: 6px; border: 3px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-thumb:hover { background: #3b444f; background-clip: content-box; }
+</style>
+</head>
+<body>
+<header>
+  <span class="repo" id="repo">…</span>
+  <span class="branch" id="branch"></span>
+  <span class="spacer"></span>
+  <span class="hint" id="totals"></span>
+  <button class="btn" id="wrap">No wrap</button>
+  <button class="btn" id="refresh">Refresh</button>
+  <button class="btn danger" id="discardAll">Discard all</button>
+</header>
+<main>
+  <aside>
+    <div class="aside-head"><span class="count" id="fcount">0</span><span>changed files</span></div>
+    <div id="files"></div>
+  </aside>
+  <section>
+    <div class="diff-head" id="diffHead" hidden>
+      <span class="path" id="diffPath"></span>
+      <span class="spacer"></span>
+      <button class="btn danger" id="discardFile">Discard file</button>
+    </div>
+    <div id="diff"></div>
+  </section>
+</main>
+<div id="veil" hidden><div class="modal">
+  <h3 id="mTitle"></h3><div id="mBody"></div>
+  <div class="row"><button class="btn" id="mCancel">Cancel</button><button class="btn primary" id="mOk">Discard</button></div>
+</div></div>
+<div id="toast" hidden></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let files = [], sel = null, sig = "", busy = false;
+
+const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const segs = parts => parts ? parts.map(([t, hi]) => hi ? `<i class="h">${esc(t)}</i>` : esc(t)).join("") : "";
+
+function toast(msg, kind) {
+  const t = $("#toast");
+  t.textContent = msg; t.className = kind || ""; t.hidden = false;
+  clearTimeout(t._t); t._t = setTimeout(() => t.hidden = true, kind === "err" ? 6000 : 2200);
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(() => ({ error: "bad response" }));
+  if (!r.ok || data.error) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+// ---- rendering -----------------------------------------------------------
+
+function splitPath(p) {
+  const i = p.lastIndexOf("/");
+  return i < 0 ? ["", p] : [p.slice(0, i + 1), p.slice(i + 1)];
+}
+
+function renderFiles() {
+  $("#fcount").textContent = files.length;
+  const adds = files.reduce((n, f) => n + f.adds, 0), dels = files.reduce((n, f) => n + f.dels, 0);
+  $("#totals").textContent = files.length ? `+${adds} −${dels}` : "";
+  const box = $("#files");
+  box.innerHTML = files.map((f, i) => {
+    const [dir, base] = splitPath(f.path);
+    const letter = { modified: "M", new: "U", added: "A", deleted: "D", renamed: "R",
+                     copied: "C", conflict: "!", typechange: "T" }[f.status] || "M";
+    return `<div class="file${f.path === sel ? " sel" : ""}" data-i="${i}" title="${esc(f.path)}">
+      <span class="mark ${f.status}">${letter}</span>
+      <span class="name"><span>${esc(dir)}</span><b>${esc(base)}</b></span>
+      ${f.staged ? '<span class="staged-dot" title="has staged changes"></span>' : ""}
+      <span class="stat">${f.binary ? "bin" : `<span class="a">+${f.adds}</span> <span class="d">−${f.dels}</span>`}</span>
+      <button class="x" data-discard="${i}" title="Discard this file">✕</button>
+    </div>`;
+  }).join("");
+  box.querySelectorAll(".file").forEach(el => {
+    el.onclick = e => {
+      if (e.target.dataset.discard !== undefined) return;
+      select(files[+el.dataset.i].path);
+    };
+  });
+  box.querySelectorAll("[data-discard]").forEach(el => {
+    el.onclick = e => { e.stopPropagation(); confirmFile(files[+el.dataset.discard]); };
+  });
+}
+
+function renderDiff(d) {
+  const pane = $("#diff");
+  if (!d) {
+    $("#diffHead").hidden = true;
+    pane.innerHTML = files.length
+      ? `<div class="empty"><div><div class="big">Pick a file</div><kbd>j</kbd> / <kbd>k</kbd> to move · <kbd>r</kbd> refresh · <kbd>w</kbd> wrap</div></div>`
+      : `<div class="empty"><div><div class="big">Working tree clean</div>Nothing to review.</div></div>`;
+    return;
+  }
+  const [dir, base] = splitPath(d.path);
+  $("#diffHead").hidden = false;
+  $("#diffPath").innerHTML = `<span>${esc(dir)}</span>${esc(base)}`;
+  if (d.binary)  { pane.innerHTML = `<div class="empty">Binary file — no text diff.</div>`; return; }
+  if (d.empty)   { pane.innerHTML = `<div class="empty">No textual changes.</div>`; return; }
+  pane.innerHTML = d.hunks.map(h => `<div class="hunk">
+    <div class="hunk-head">
+      <span>@@ ${esc(h.header) || `hunk ${h.index + 1}`}</span>
+      <span class="spacer"></span>
+      <button class="btn danger" data-hunk="${h.index}">Discard hunk</button>
+    </div>
+    <table class="sbs"><tbody>${h.rows.map(r => `<tr class="${r.type}">
+      <td class="n">${r.oldNo ?? ""}</td><td class="c l">${segs(r.old)}</td>
+      <td class="n">${r.newNo ?? ""}</td><td class="c r">${segs(r.new)}</td>
+    </tr>`).join("")}</tbody></table></div>`).join("");
+  pane.querySelectorAll("[data-hunk]").forEach(el => {
+    el.onclick = () => confirmHunk(d.path, +el.dataset.hunk);
+  });
+  pane.scrollTop = 0;
+}
+
+// ---- data ----------------------------------------------------------------
+
+async function load(keepScroll) {
+  const st = await api("/api/status");
+  $("#repo").textContent = st.repo;
+  $("#branch").textContent = st.branch;
+  document.title = `${st.repo} — diffbox`;
+  files = st.files;
+  if (st.sig === sig && keepScroll) return;
+  sig = st.sig;
+  if (sel && !files.some(f => f.path === sel)) sel = null;
+  if (!sel && files.length) sel = files[0].path;
+  renderFiles();
+  await showDiff();
+}
+
+async function showDiff() {
+  if (!sel) return renderDiff(null);
+  const f = files.find(x => x.path === sel);
+  try {
+    renderDiff(await api(`/api/diff?path=${encodeURIComponent(sel)}&untracked=${f && f.untracked ? 1 : 0}`));
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function select(path) { sel = path; renderFiles(); showDiff(); }
+
+// ---- destructive ---------------------------------------------------------
+
+function ask(title, bodyHtml, okLabel) {
+  return new Promise(resolve => {
+    $("#mTitle").textContent = title;
+    $("#mBody").innerHTML = bodyHtml;
+    $("#mOk").textContent = okLabel || "Discard";
+    $("#veil").hidden = false;
+    $("#mOk").focus();
+    const done = v => { $("#veil").hidden = true; document.removeEventListener("keydown", key, true); resolve(v); };
+    const key = e => {
+      if (e.key === "Escape") { e.stopPropagation(); done(false); }
+      if (e.key === "Enter") { e.stopPropagation(); done(true); }
+    };
+    document.addEventListener("keydown", key, true);
+    $("#mOk").onclick = () => done(true);
+    $("#mCancel").onclick = () => done(false);
+    $("#veil").onclick = e => { if (e.target.id === "veil") done(false); };
+  });
+}
+
+async function post(url, body) {
+  if (busy) return;
+  busy = true;
+  try {
+    const r = await api(url, { method: "POST", headers: { "Content-Type": "application/json" },
+                               body: JSON.stringify(body) });
+    sig = "";
+    await load();
+    toast(r.message || "Discarded", "ok");
+  } catch (e) { toast(e.message, "err"); }
+  finally { busy = false; }
+}
+
+async function confirmFile(f) {
+  if (!f) return;
+  const what = f.untracked ? "delete this untracked file" : "restore this file to HEAD";
+  if (!await ask("Discard file?",
+      `<p>This will ${what}. It cannot be undone.</p><p><code>${esc(f.path)}</code></p>`)) return;
+  await post("/api/discard-file", { path: f.path, untracked: !!f.untracked });
+}
+
+async function confirmHunk(path, index) {
+  if (!await ask("Discard hunk?",
+      `<p>Reverts just this hunk in the working tree.</p><p><code>${esc(path)}</code></p>`)) return;
+  await post("/api/discard-hunk", { path, index });
+}
+
+$("#discardAll").onclick = async () => {
+  if (!files.length) return toast("Nothing to discard");
+  const untracked = files.filter(f => f.untracked).length;
+  const ok = await ask("Discard ALL changes?",
+    `<p>Resets <b>${files.length}</b> file(s) in <code>${esc($("#repo").textContent)}</code> back to HEAD. This cannot be undone.</p>` +
+    (untracked ? `<label><input type="checkbox" id="mClean"> Also delete ${untracked} untracked file(s)</label>` : ""),
+    "Discard everything");
+  if (!ok) return;
+  await post("/api/discard-all", { untracked: !!(document.getElementById("mClean") || {}).checked });
+};
+
+// ---- chrome --------------------------------------------------------------
+
+$("#refresh").onclick = () => { sig = ""; load().catch(e => toast(e.message, "err")); };
+$("#discardFile").onclick = () => confirmFile(files.find(f => f.path === sel));
+function syncWrap() {
+  const off = document.body.classList.contains("nowrap");
+  $("#wrap").textContent = off ? "Wrap" : "No wrap";
+  localStorage.setItem("nowrap", off ? "1" : "0");
+}
+$("#wrap").onclick = () => { document.body.classList.toggle("nowrap"); syncWrap(); };
+if (localStorage.getItem("nowrap") === "1") document.body.classList.add("nowrap");
+syncWrap();
+
+document.addEventListener("keydown", e => {
+  if (!$("#veil").hidden || e.metaKey || e.ctrlKey) return;
+  const i = files.findIndex(f => f.path === sel);
+  if (e.key === "j" || e.key === "ArrowDown") { if (files[i + 1]) select(files[i + 1].path); e.preventDefault(); }
+  if (e.key === "k" || e.key === "ArrowUp")   { if (files[i - 1]) select(files[i - 1].path); e.preventDefault(); }
+  if (e.key === "r") $("#refresh").click();
+  if (e.key === "w") $("#wrap").click();
+  if (e.key === "d") $("#discardFile").click();
+});
+
+load().catch(e => toast(e.message, "err"));
+setInterval(() => { if (!document.hidden && !busy && $("#veil").hidden) load(true).catch(() => {}); }, 2000);
+</script>
+</body>
+</html>
+"""
+
+
+# ----------------------------------------------------------------- http glue
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "diffbox"
+    repo: Repo = None
+
+    def log_message(self, *_):
+        pass
+
+    # -- plumbing -------------------------------------------------------
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body if isinstance(body, bytes) else body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except BrokenPipeError:
+            pass
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj))
+
+    def _err(self, msg, code=400):
+        self._json({"error": str(msg)}, code)
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return json.loads(self.rfile.read(n) or b"{}")
+
+    # -- routes ---------------------------------------------------------
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        q = parse_qs(url.query)
+        try:
+            if url.path == "/":
+                return self._send(200, INDEX_HTML, "text/html; charset=utf-8")
+            if url.path == "/api/status":
+                files = self.repo.status()
+                return self._json({
+                    "repo": self.repo.root.name,
+                    "root": str(self.repo.root),
+                    "branch": self.repo.branch(),
+                    "files": files,
+                    "sig": self._sig(files),
+                })
+            if url.path == "/api/diff":
+                path = (q.get("path") or [""])[0]
+                untracked = (q.get("untracked") or ["0"])[0] == "1"
+                if not path:
+                    return self._err("missing path")
+                return self._json(self.repo.diff(path, untracked))
+            self._err("not found", 404)
+        except GitError as e:
+            self._err(e)
+        except Exception as e:  # keep the UI alive with a readable message
+            self._err(f"{type(e).__name__}: {e}", 500)
+
+    def do_POST(self):
+        url = urlparse(self.path)
+        try:
+            b = self._body()
+            if url.path == "/api/discard-file":
+                self.repo.discard_file(b["path"], bool(b.get("untracked")))
+                return self._json({"ok": True, "message": f"Discarded {b['path']}"})
+            if url.path == "/api/discard-hunk":
+                self.repo.discard_hunk(b["path"], int(b["index"]), bool(b.get("untracked")))
+                return self._json({"ok": True, "message": "Hunk discarded"})
+            if url.path == "/api/discard-all":
+                n = len(self.repo.status())
+                self.repo.discard_all(bool(b.get("untracked")))
+                return self._json({"ok": True, "message": f"Discarded {n} file(s)"})
+            self._err("not found", 404)
+        except GitError as e:
+            self._err(e)
+        except KeyError as e:
+            self._err(f"missing field {e}")
+        except Exception as e:
+            self._err(f"{type(e).__name__}: {e}", 500)
+
+    def _sig(self, files):
+        """Cheap change token: status + sizes/mtimes of the changed files."""
+        bits = []
+        for f in files:
+            p = self.repo.root / f["path"]
+            try:
+                st = p.stat()
+                bits.append(f"{f['path']}:{f['code']}:{st.st_size}:{st.st_mtime_ns}")
+            except OSError:
+                bits.append(f"{f['path']}:{f['code']}:-")
+        return str(hash("|".join(bits)))
+
+
+class Server(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="diffbox", description="A very light GitKraken.")
+    ap.add_argument("repo", nargs="?", default=".", help="repository path (default: cwd)")
+    ap.add_argument("-p", "--port", type=int, default=int(os.environ.get("DIFFBOX_PORT", DEFAULT_PORT)))
+    ap.add_argument("--no-open", action="store_true", help="do not open a browser")
+    args = ap.parse_args()
+
+    try:
+        repo = Repo(Path(args.repo).expanduser().resolve())
+    except GitError as e:
+        print(f"diffbox: {e}", file=sys.stderr)
+        return 2
+
+    Handler.repo = repo
+    port = args.port
+    for attempt in range(20):
+        try:
+            httpd = Server((BIND_HOST, port), Handler)
+            break
+        except OSError:
+            port += 1
+    else:
+        print(f"diffbox: no free port near {args.port}", file=sys.stderr)
+        return 1
+
+    url = f"http://{BIND_HOST}:{port}"
+    print(f"diffbox  {repo.root}  ({repo.branch()})\n         {url}   ctrl-c to stop")
+    if not args.no_open:
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
