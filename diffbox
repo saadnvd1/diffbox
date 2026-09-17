@@ -4,7 +4,7 @@
 Runs a local web UI (127.0.0.1 only) against any git repository.
 
     diffbox                 # current repo
-    diffbox ~/dev/edge      # a specific repo
+    diffbox ~/code/myproject      # a specific repo
     diffbox --port 3090 --no-open
 """
 

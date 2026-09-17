@@ -9,13 +9,22 @@ browser. Works against any git repo.
 
 ```bash
 diffbox                 # the repo you are standing in
-diffbox ~/dev/edge      # a specific repo
+diffbox ~/code/myproject  # a specific repo
 diffbox -p 3090         # a specific port (default 3085, walks up if taken)
 diffbox --no-open       # do not open a browser
 ```
 
-`db` is a shorter alias for the same thing. Both are symlinked into
-`~/.local/bin`.
+## Install
+
+No dependencies beyond `git` and Python 3.9+. Clone it and put the script on
+your `PATH`:
+
+```bash
+git clone https://github.com/saadnvd1/diffbox.git
+cd diffbox
+ln -s "$PWD/diffbox" ~/.local/bin/diffbox
+ln -s "$PWD/diffbox" ~/.local/bin/db      # optional short alias
+```
 
 ## What it shows
 
@@ -56,6 +65,10 @@ refresh.
 ## Notes
 
 - Binds `127.0.0.1` only, deliberately: this app deletes work, and it is not
-  something to hand to the tailnet.
+  something to expose on a network.
 - Diffs use `-U3` context. Two nearby edits will render as one hunk.
 - Requires `git` and Python 3.9+. No pip install, no node, no build step.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -1,7 +1,8 @@
 # diffbox — for Claude
 
-Single-file Python app at `./diffbox` (~860 lines, stdlib only). Symlinked to
-`~/.local/bin/diffbox` and `~/.local/bin/db`. Read `README.md` for behaviour.
+Single-file Python app at `./diffbox` (~860 lines, stdlib only). Installed by
+symlinking it onto `PATH` as `diffbox` and `db`. Read `README.md` for
+behaviour.
 
 ## Shape
 
@@ -31,11 +32,12 @@ Single-file Python app at `./diffbox` (~860 lines, stdlib only). Symlinked to
 
 No test suite yet. The manual loop: make a scratch repo, modify/delete/add
 files, then exercise each discard path and confirm with `git status`.
-A headless screenshot is the fastest UI check:
+A headless screenshot is the fastest UI check (macOS path shown; use whatever
+`chrome`/`chromium` binary you have):
 
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless \
       --disable-gpu --window-size=1400,850 --virtual-time-budget=6000 \
       --screenshot=ui.png http://127.0.0.1:3085/
 
-(`folio <url> out.pdf` renders the page for print and comes back blank here —
-the flex layout collapses in paged media. Use the raster screenshot.)
+Print-to-PDF renderers come back blank here — the flex layout collapses in
+paged media. Use the raster screenshot.
